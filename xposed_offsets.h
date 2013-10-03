@@ -30,6 +30,19 @@ const char* xposedOffsetModesDesc[] = {
     "NO_JIT",
 };
 
+#if PLATFORM_SDK_VERSION < 14
+MEMBER_OFFSET_DEFINE(Thread, jniLocalRefTable, 76, 72)
+#define offset_type_Thread_jniLocalRefTable ReferenceTable
+
+MEMBER_OFFSET_DEFINE(Thread, status, 4, 4)
+#define offset_type_Thread_status ThreadStatus
+
+MEMBER_OFFSET_DEFINE(Thread, jniEnv, 52, 52)
+#define offset_type_Thread_jniEnv JNIEnv*
+
+MEMBER_OFFSET_DEFINE(DvmJitGlobals, codeCacheFull, 100, 0)
+#define offset_type_DvmJitGlobals_codeCacheFull bool
+#else
 MEMBER_OFFSET_DEFINE(Thread, jniLocalRefTable, 168, 100)
 #define offset_type_Thread_jniLocalRefTable IndirectRefTable
 
@@ -41,6 +54,7 @@ MEMBER_OFFSET_DEFINE(Thread, jniEnv, 872, 136)
 
 MEMBER_OFFSET_DEFINE(DvmJitGlobals, codeCacheFull, 120, 0)
 #define offset_type_DvmJitGlobals_codeCacheFull bool
+#endif
 
 
 

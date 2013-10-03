@@ -1,6 +1,10 @@
 #include <stdio.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#ifdef __ARM_NR_cacheflush
+#define __clear_cache(x, y) syscall(__ARM_NR_cacheflush, x, y, 0)
+#endif
 
 static void replaceAsm(void* function, char* newCode, int len) {
 #ifdef __arm__
