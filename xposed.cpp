@@ -177,7 +177,7 @@ bool xposedOnVmCreated(JNIEnv* env, const char* className) {
     patchReturnTrue((void*) &dvmCheckClassAccess);
     patchReturnTrue((void*) &dvmCheckFieldAccess);
     patchReturnTrue((void*) &dvmInSamePackage);
-    if (access(XPOSED_DIR "do_not_hook_dvmCheckMethodAccess", F_OK) != 0)
+    if (access(XPOSED_DIR "conf/do_not_hook_dvmCheckMethodAccess", F_OK) != 0)
         patchReturnTrue((void*) &dvmCheckMethodAccess);
 
     xposedClass = env->FindClass(XPOSED_CLASS);
@@ -321,9 +321,8 @@ static XposedOriginalMethodsIt findXposedOriginalMethod(const Method* method) {
 
     XposedOriginalMethodsIt it;
     for (XposedOriginalMethodsIt it = xposedOriginalMethods.begin() ; it != xposedOriginalMethods.end(); it++ ) {
-        if (strcmp(it->name, method->name) == 0
-         && strcmp(it->clazz->descriptor, method->clazz->descriptor) == 0
-         && dexProtoCompare(&it->prototype, &method->prototype) == 0) {
+        if (strcmp(it->clazz->descriptor, method->clazz->descriptor) == 0
+         && dvmCompareMethodNamesAndProtos(&(*it), method) == 0) {
             return it;
         }
     }
@@ -375,7 +374,7 @@ static jobject xposedAddLocalReference(::Thread* self, Object* obj) {
 #endif
 }
 
-static void replaceAsm(void* function, char* newCode, int len) {
+static void replaceAsm(void* function, unsigned const char* newCode, int len) {
 #ifdef __arm__
     function = (void*)((int)function & ~1);
 #endif
@@ -388,14 +387,14 @@ static void replaceAsm(void* function, char* newCode, int len) {
 
 static void patchReturnTrue(void* function) {
 #ifdef __arm__
-    char asmReturnTrueThumb[] = { 0x01, 0x20, 0x70, 0x47 };
-    char asmReturnTrueArm[] = { 0x01, 0x00, 0xA0, 0xE3, 0x1E, 0xFF, 0x2F, 0xE1 };
+    unsigned const char asmReturnTrueThumb[] = { 0x01, 0x20, 0x70, 0x47 };
+    unsigned const char asmReturnTrueArm[] = { 0x01, 0x00, 0xA0, 0xE3, 0x1E, 0xFF, 0x2F, 0xE1 };
     if ((int)function & 1)
         replaceAsm(function, asmReturnTrueThumb, sizeof(asmReturnTrueThumb));
     else
         replaceAsm(function, asmReturnTrueArm, sizeof(asmReturnTrueArm));
 #else
-    char asmReturnTrueX86[] = { 0x31, 0xC0, 0x40, 0xC3 };
+    unsigned const char asmReturnTrueX86[] = { 0x31, 0xC0, 0x40, 0xC3 };
     replaceAsm(function, asmReturnTrueX86, sizeof(asmReturnTrueX86));
 #endif
 }

@@ -19,14 +19,14 @@ struct MethodXposedExt : Method {
 
 namespace android {
 
-#define XPOSED_DIR "/data/xposed/"
-#define XPOSED_JAR XPOSED_DIR "XposedBridge.jar"
-#define XPOSED_JAR_NEWVERSION XPOSED_DIR "XposedBridge.jar.newversion"
-#define XPOSED_LOAD_BLOCKER XPOSED_DIR "disabled"
+#define XPOSED_DIR "/data/data/de.robv.android.xposed.installer/"
+#define XPOSED_JAR XPOSED_DIR "bin/XposedBridge.jar"
+#define XPOSED_JAR_NEWVERSION XPOSED_DIR "bin/XposedBridge.jar.newversion"
+#define XPOSED_LOAD_BLOCKER XPOSED_DIR "conf/disabled"
 #define XPOSED_CLASS "de/robv/android/xposed/XposedBridge"
 #define XPOSED_CLASS_DOTS "de.robv.android.xposed.XposedBridge"
 #define XRESOURCES_CLASS "android/content/res/XResources"
-#define XPOSED_VERSION "39"
+#define XPOSED_VERSION "41"
 
 #ifndef ALOGD
 #define ALOGD LOGD
@@ -50,7 +50,7 @@ static void xposedInitMemberOffsets();
 static void xposedCallHandler(const u4* args, JValue* pResult, const Method* method, ::Thread* self);
 static XposedOriginalMethodsIt findXposedOriginalMethod(const Method* method);
 static jobject xposedAddLocalReference(::Thread* self, Object* obj);
-static void replaceAsm(void* function, char* newCode, int len);
+static void replaceAsm(void* function, unsigned const char* newCode, int len);
 static void patchReturnTrue(void* function);
 
 // JNI methods
