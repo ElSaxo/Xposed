@@ -29,6 +29,8 @@
 
 #include "xposed_offsets.h"
 
+extern int RUNNING_PLATFORM_SDK_VERSION;
+
 
 namespace android {
 
@@ -36,14 +38,15 @@ namespace android {
 // variables
 ////////////////////////////////////////////////////////////
 bool keepLoadingXposed = false;
+ClassObject* objectArrayClass = NULL;
 jclass xposedClass = NULL;
-jmethodID xposedHandleHookedMethod = NULL;
+Method* xposedHandleHookedMethod = NULL;
 jclass xresourcesClass = NULL;
 jmethodID xresourcesTranslateResId = NULL;
 jmethodID xresourcesTranslateAttrId = NULL;
-std::list<MethodXposedExt> xposedOriginalMethods;
 const char* startClassName = NULL;
 void* PTR_gDvmJit = NULL;
+size_t arrayContentsOffset = 0;
 
 #if PLATFORM_SDK_VERSION < 14
 #define dvmUnboxPrimitive dvmUnwrapPrimitive
@@ -96,6 +99,18 @@ void xposedInfo() {
     ALOGD("Starting Xposed binary version %s, compiled for SDK %d\n", XPOSED_VERSION, PLATFORM_SDK_VERSION);
     ALOGD("Phone: %s (%s), Android version %s (SDK %s)\n", model, manufacturer, release, sdk);
     ALOGD("ROM: %s\n", rom);
+}
+
+void xposedEnforceDalvik() {
+    if (RUNNING_PLATFORM_SDK_VERSION < 19)
+        return;
+
+    char runtime[PROPERTY_VALUE_MAX];
+    property_get("persist.sys.dalvik.vm.lib", runtime, "");
+    if (strcmp(runtime, "libdvm.so") != 0) {
+        ALOGE("Unsupported runtime library %s, setting to libdvm.so", runtime);
+        property_set("persist.sys.dalvik.vm.lib", "libdvm.so");
+    }
 }
 
 bool isXposedDisabled() {
@@ -166,19 +181,18 @@ bool addXposedToClasspath(bool zygote) {
 
 
 bool xposedOnVmCreated(JNIEnv* env, const char* className) {
-    if (!keepLoadingXposed)
-        return false;
-        
     startClassName = className;
 
-    xposedInitMemberOffsets();
+    keepLoadingXposed = keepLoadingXposed && xposedInitMemberOffsets(env);
+    if (!keepLoadingXposed)
+        return false;
 
     // disable some access checks
-    patchReturnTrue((void*) &dvmCheckClassAccess);
-    patchReturnTrue((void*) &dvmCheckFieldAccess);
-    patchReturnTrue((void*) &dvmInSamePackage);
+    patchReturnTrue((uintptr_t) &dvmCheckClassAccess);
+    patchReturnTrue((uintptr_t) &dvmCheckFieldAccess);
+    patchReturnTrue((uintptr_t) &dvmInSamePackage);
     if (access(XPOSED_DIR "conf/do_not_hook_dvmCheckMethodAccess", F_OK) != 0)
-        patchReturnTrue((void*) &dvmCheckMethodAccess);
+        patchReturnTrue((uintptr_t) &dvmCheckMethodAccess);
 
     jclass miuiResourcesClass = env->FindClass(MIUI_RESOURCES_CLASS);
     if (miuiResourcesClass != NULL) {
@@ -209,7 +223,7 @@ bool xposedOnVmCreated(JNIEnv* env, const char* className) {
 }
 
 
-static void xposedInitMemberOffsets() {
+static bool xposedInitMemberOffsets(JNIEnv* env) {
     PTR_gDvmJit = dlsym(RTLD_DEFAULT, "gDvmJit");
 
     if (PTR_gDvmJit == NULL) {
@@ -219,10 +233,34 @@ static void xposedInitMemberOffsets() {
     }
     ALOGD("Using structure member offsets for mode %s", xposedOffsetModesDesc[offsetMode]);
 
-    MEMBER_OFFSET_COPY(Thread, jniLocalRefTable);
-    MEMBER_OFFSET_COPY(Thread, status);
-    MEMBER_OFFSET_COPY(Thread, jniEnv);
     MEMBER_OFFSET_COPY(DvmJitGlobals, codeCacheFull);
+
+    // detect offset of ArrayObject->contents
+    jintArray dummyArray = env->NewIntArray(1);
+    if (dummyArray == NULL) {
+        ALOGE("Could allocate int array for testing");
+        dvmLogExceptionStackTrace();
+        env->ExceptionClear();
+        return false;
+    }
+
+    jint* dummyArrayElements = env->GetIntArrayElements(dummyArray, NULL);
+    arrayContentsOffset = (size_t)dummyArrayElements - (size_t)dvmDecodeIndirectRef(dvmThreadSelf(), dummyArray);
+    env->ReleaseIntArrayElements(dummyArray,dummyArrayElements, 0);
+    env->DeleteLocalRef(dummyArray);
+
+    if (arrayContentsOffset < 12 || arrayContentsOffset > 128) {
+        ALOGE("Detected strange offset %d of ArrayObject->contents", arrayContentsOffset);
+        return false;
+    }
+
+    return true;
+}
+
+static inline void xposedSetObjectArrayElement(const ArrayObject* obj, int index, Object* val) {
+    uintptr_t arrayContents = (uintptr_t)obj + arrayContentsOffset;
+    ((Object **)arrayContents)[index] = val;
+    dvmWriteBarrierArray(obj, index, index + 1);
 }
 
 
@@ -231,20 +269,15 @@ static void xposedInitMemberOffsets() {
 ////////////////////////////////////////////////////////////
 
 static void xposedCallHandler(const u4* args, JValue* pResult, const Method* method, ::Thread* self) {
-    XposedOriginalMethodsIt original = findXposedOriginalMethod(method);
-    if (original == xposedOriginalMethods.end()) {
+    if (!xposedIsHooked(method)) {
         dvmThrowNoSuchMethodError("could not find Xposed original method - how did you even get here?");
         return;
     }
-    
-    ThreadStatus oldThreadStatus = MEMBER_VAL(self, Thread, status);
-    JNIEnv* env = MEMBER_VAL(self, Thread, jniEnv);
-    
-    // get java.lang.reflect.Method object for original method
-    jobject originalReflected = env->ToReflectedMethod(
-        (jclass)xposedAddLocalReference(self, (Object*)original->clazz),
-        (jmethodID)method,
-        true);
+
+    XposedHookInfo* hookInfo = (XposedHookInfo*) method->insns;
+    Method* original = (Method*) hookInfo;
+    Object* originalReflected = hookInfo->reflectedMethod;
+    Object* additionalInfo = hookInfo->additionalInfo;
   
     // convert/box arguments
     const char* desc = &method->shorty[1]; // [0] is the return type.
@@ -253,13 +286,15 @@ static void xposedCallHandler(const u4* args, JValue* pResult, const Method* met
     size_t dstIndex = 0;
     
     // for non-static methods determine the "this" pointer
-    if (!dvmIsStaticMethod(&(*original))) {
-        thisObject = (Object*) xposedAddLocalReference(self, (Object*)args[0]);
+    if (!dvmIsStaticMethod(original)) {
+        thisObject = (Object*) args[0];
         srcIndex++;
     }
     
-    jclass objectClass = env->FindClass("java/lang/Object");
-    jobjectArray argsArray = env->NewObjectArray(strlen(method->shorty) - 1, objectClass, NULL);
+    ArrayObject* argsArray = dvmAllocArrayByClass(objectArrayClass, strlen(method->shorty) - 1, ALLOC_DEFAULT);
+    if (argsArray == NULL) {
+        return;
+    }
     
     while (*desc != '\0') {
         char descChar = *(desc++);
@@ -275,14 +310,14 @@ static void xposedCallHandler(const u4* args, JValue* pResult, const Method* met
         case 'I':
             value.i = args[srcIndex++];
             obj = (Object*) dvmBoxPrimitive(value, dvmFindPrimitiveClass(descChar));
-            dvmReleaseTrackedAlloc(obj, NULL);
+            dvmReleaseTrackedAlloc(obj, self);
             break;
         case 'D':
         case 'J':
             value.j = dvmGetArgLong(args, srcIndex);
             srcIndex += 2;
             obj = (Object*) dvmBoxPrimitive(value, dvmFindPrimitiveClass(descChar));
-            dvmReleaseTrackedAlloc(obj, NULL);
+            dvmReleaseTrackedAlloc(obj, self);
             break;
         case '[':
         case 'L':
@@ -293,115 +328,59 @@ static void xposedCallHandler(const u4* args, JValue* pResult, const Method* met
             obj = NULL;
             srcIndex++;
         }
-        env->SetObjectArrayElement(argsArray, dstIndex++, xposedAddLocalReference(self, obj));
+        xposedSetObjectArrayElement(argsArray, dstIndex++, obj);
     }
     
     // call the Java handler function
-    jobject resultRef = env->CallStaticObjectMethod(
-        xposedClass, xposedHandleHookedMethod, originalReflected, thisObject, argsArray);
+    JValue result;
+    dvmCallMethod(self, xposedHandleHookedMethod, NULL, &result,
+        originalReflected, (int) original, additionalInfo, thisObject, argsArray);
         
+    dvmReleaseTrackedAlloc(argsArray, self);
+
     // exceptions are thrown to the caller
-    if (env->ExceptionCheck()) {
-        dvmChangeStatus(self, oldThreadStatus);
+    if (dvmCheckException(self)) {
         return;
     }
-    
+
     // return result with proper type
-    Object* result = dvmDecodeIndirectRef(self, resultRef);
     ClassObject* returnType = dvmGetBoxedReturnType(method);
     if (returnType->primitiveType == PRIM_VOID) {
         // ignored
-    } else if (result == NULL) {
+    } else if (result.l == NULL) {
         if (dvmIsPrimitiveClass(returnType)) {
             dvmThrowNullPointerException("null result when primitive expected");
         }
         pResult->l = NULL;
     } else {
-        if (!dvmUnboxPrimitive(result, returnType, pResult)) {
-            dvmThrowClassCastException(result->clazz, returnType);
+        if (!dvmUnboxPrimitive(result.l, returnType, pResult)) {
+            dvmThrowClassCastException(result.l->clazz, returnType);
         }
     }
-    
-    // set the thread status back to running. must be done after the last env->...()
-    dvmChangeStatus(self, oldThreadStatus);
 }
 
 
-static XposedOriginalMethodsIt findXposedOriginalMethod(const Method* method) {
-    if (method == NULL)
-        return xposedOriginalMethods.end();
-
-    XposedOriginalMethodsIt it;
-    for (XposedOriginalMethodsIt it = xposedOriginalMethods.begin() ; it != xposedOriginalMethods.end(); it++ ) {
-        if (strcmp(it->clazz->descriptor, method->clazz->descriptor) == 0
-         && dvmCompareMethodNamesAndProtos(&(*it), method) == 0) {
-            return it;
-        }
-    }
-
-    return xposedOriginalMethods.end();
-}
-
-
-// work-around to get a reference wrapper to an object so that it can be used
-// for certain calls to the JNI environment. almost verbatim copy from Jni.cpp
-static jobject xposedAddLocalReference(::Thread* self, Object* obj) {
-    if (obj == NULL) {
-        return NULL;
-    }
-
-#if PLATFORM_SDK_VERSION < 14
-    ReferenceTable* pRefTable = MEMBER_PTR(self, Thread, jniLocalRefTable);
-
-    if (!dvmAddToReferenceTable(pRefTable, obj)) {
-        dvmDumpReferenceTable(pRefTable, "JNI local");
-        LOGE("Failed adding to JNI local ref table (has %d entries)\n",
-            (int) dvmReferenceTableEntries(pRefTable));
-        dvmDumpThread(dvmThreadSelf(), false);
-        dvmAbort();     // spec says call FatalError; this is equivalent
-    } else {
-        LOGVV("LREF add %p  (%s.%s) (ent=%d)\n", obj,
-            dvmGetCurrentJNIMethod()->clazz->descriptor,
-            dvmGetCurrentJNIMethod()->name,
-            (int) dvmReferenceTableEntries(pRefTable));
-    }
-
-    return (jobject) obj;
-#else
-    IndirectRefTable* pRefTable = MEMBER_PTR(self, Thread, jniLocalRefTable);
-    void* curFrame = self->interpSave.curFrame;
-    u4 cookie = SAVEAREA_FROM_FP(curFrame)->xtra.localRefCookie;
-    jobject jobj = (jobject) pRefTable->add(cookie, obj);
-    if (UNLIKELY(jobj == NULL)) {
-        pRefTable->dump("JNI local");
-        ALOGE("Failed adding to JNI local ref table (has %zd entries)", pRefTable->capacity());
-        dvmDumpThread(self, false);
-        dvmAbort();     // spec says call FatalError; this is equivalent
-    }
-    if (UNLIKELY(gDvmJni.workAroundAppJniBugs)) {
-        // Hand out direct pointers to support broken old apps.
-        return reinterpret_cast<jobject>(obj);
-    }
-    return jobj;
-#endif
-}
-
-static void replaceAsm(void* function, unsigned const char* newCode, int len) {
+static void replaceAsm(uintptr_t function, unsigned const char* newCode, size_t len) {
 #ifdef __arm__
-    function = (void*)((int)function & ~1);
+    function = function & ~1;
 #endif
-    void* pageStart = (void*)((int)function & ~(PAGESIZE-1));
-    mprotect(pageStart, PAGESIZE, PROT_READ | PROT_WRITE | PROT_EXEC);
-    memcpy(function, newCode, len);
-    mprotect(pageStart, PAGESIZE, PROT_READ | PROT_EXEC);
-    __clear_cache(function, (char*)function+len);
+    uintptr_t pageStart = function & ~(PAGESIZE-1);
+    size_t pageProtectSize = PAGESIZE;
+    if (function+len > pageStart+pageProtectSize)
+        pageProtectSize += PAGESIZE;
+
+    mprotect((void*)pageStart, pageProtectSize, PROT_READ | PROT_WRITE | PROT_EXEC);
+    memcpy((void*)function, newCode, len);
+    mprotect((void*)pageStart, pageProtectSize, PROT_READ | PROT_EXEC);
+
+    __clear_cache((void*)function, (void*)(function+len));
 }
 
-static void patchReturnTrue(void* function) {
+static void patchReturnTrue(uintptr_t function) {
 #ifdef __arm__
     unsigned const char asmReturnTrueThumb[] = { 0x01, 0x20, 0x70, 0x47 };
     unsigned const char asmReturnTrueArm[] = { 0x01, 0x00, 0xA0, 0xE3, 0x1E, 0xFF, 0x2F, 0xE1 };
-    if ((int)function & 1)
+    if (function & 1)
         replaceAsm(function, asmReturnTrueThumb, sizeof(asmReturnTrueThumb));
     else
         replaceAsm(function, asmReturnTrueArm, sizeof(asmReturnTrueArm));
@@ -423,10 +402,32 @@ static jboolean de_robv_android_xposed_XposedBridge_initNative(JNIEnv* env, jcla
         return false;
     }
 
-    xposedHandleHookedMethod = env->GetStaticMethodID(xposedClass, "handleHookedMethod",
-        "(Ljava/lang/reflect/Member;Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;");
+    ::Thread* self = dvmThreadSelf();
+
+    xposedHandleHookedMethod = (Method*) env->GetStaticMethodID(xposedClass, "handleHookedMethod",
+        "(Ljava/lang/reflect/Member;ILjava/lang/Object;Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;");
     if (xposedHandleHookedMethod == NULL) {
-        ALOGE("ERROR: could not find method %s.handleHookedMethod(Method, Object, Object[])\n", XPOSED_CLASS);
+        ALOGE("ERROR: could not find method %s.handleHookedMethod(Member, int, Object, Object, Object[])\n", XPOSED_CLASS);
+        dvmLogExceptionStackTrace();
+        env->ExceptionClear();
+        keepLoadingXposed = false;
+        return false;
+    }
+
+    Method* xposedInvokeOriginalMethodNative = (Method*) env->GetStaticMethodID(xposedClass, "invokeOriginalMethodNative",
+        "(Ljava/lang/reflect/Member;I[Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;");
+    if (xposedInvokeOriginalMethodNative == NULL) {
+        ALOGE("ERROR: could not find method %s.invokeOriginalMethodNative(Member, int, Class[], Class, Object, Object[])\n", XPOSED_CLASS);
+        dvmLogExceptionStackTrace();
+        env->ExceptionClear();
+        keepLoadingXposed = false;
+        return false;
+    }
+    dvmSetNativeFunc(xposedInvokeOriginalMethodNative, de_robv_android_xposed_XposedBridge_invokeOriginalMethodNative, NULL);
+
+    objectArrayClass = dvmFindArrayClass("[Ljava/lang/Object;", NULL);
+    if (objectArrayClass == NULL) {
+        ALOGE("Error while loading Object[] class");
         dvmLogExceptionStackTrace();
         env->ExceptionClear();
         keepLoadingXposed = false;
@@ -470,10 +471,11 @@ static jboolean de_robv_android_xposed_XposedBridge_initNative(JNIEnv* env, jcla
     return true;
 }
 
-static void de_robv_android_xposed_XposedBridge_hookMethodNative(JNIEnv* env, jclass clazz, jobject declaredClassIndirect, jint slot) {
+static void de_robv_android_xposed_XposedBridge_hookMethodNative(JNIEnv* env, jclass clazz, jobject reflectedMethodIndirect,
+            jobject declaredClassIndirect, jint slot, jobject additionalInfoIndirect) {
     // Usage errors?
-    if (declaredClassIndirect == NULL) {
-        dvmThrowIllegalArgumentException("declaredClass must not be null");
+    if (declaredClassIndirect == NULL || reflectedMethodIndirect == NULL) {
+        dvmThrowIllegalArgumentException("method and declaredClass must not be null");
         return;
     }
     
@@ -485,17 +487,21 @@ static void de_robv_android_xposed_XposedBridge_hookMethodNative(JNIEnv* env, jc
         return;
     }
     
-    if (findXposedOriginalMethod(method) != xposedOriginalMethods.end()) {
+    if (xposedIsHooked(method)) {
         // already hooked
         return;
     }
     
-    // Save a copy of the original method
-    xposedOriginalMethods.push_front(*((MethodXposedExt*)method));
+    // Save a copy of the original method and other hook info
+    XposedHookInfo* hookInfo = (XposedHookInfo*) calloc(1, sizeof(XposedHookInfo));
+    memcpy(hookInfo, method, sizeof(hookInfo->originalMethodStruct));
+    hookInfo->reflectedMethod = dvmDecodeIndirectRef(dvmThreadSelf(), env->NewGlobalRef(reflectedMethodIndirect));
+    hookInfo->additionalInfo = dvmDecodeIndirectRef(dvmThreadSelf(), env->NewGlobalRef(additionalInfoIndirect));
 
     // Replace method with our own code
     SET_METHOD_FLAG(method, ACC_NATIVE);
     method->nativeFunc = &xposedCallHandler;
+    method->insns = (const u2*) hookInfo;
     method->registersSize = method->insSize;
     method->outsSize = 0;
 
@@ -505,30 +511,29 @@ static void de_robv_android_xposed_XposedBridge_hookMethodNative(JNIEnv* env, jc
     }
 }
 
+static inline bool xposedIsHooked(const Method* method) {
+    return (method->nativeFunc == &xposedCallHandler);
+}
+
 // simplified copy of Method.invokeNative, but calls the original (non-hooked) method and has no access checks
 // used when a method has been hooked
-static jobject de_robv_android_xposed_XposedBridge_invokeOriginalMethodNative(JNIEnv* env, jclass clazz, jobject reflectedMethod,
-            jobjectArray params1, jclass returnType1, jobject thisObject1, jobjectArray args1) {
-    // try to find the original method
-    Method* method = (Method*)env->FromReflectedMethod(reflectedMethod);
-    XposedOriginalMethodsIt original = findXposedOriginalMethod(method);
-    if (original != xposedOriginalMethods.end()) {
-        method = &(*original);
+static void de_robv_android_xposed_XposedBridge_invokeOriginalMethodNative(const u4* args, JValue* pResult,
+            const Method* method, ::Thread* self) {
+    Method* meth = (Method*) args[1];
+    if (meth == NULL) {
+        meth = dvmGetMethodFromReflectObj((Object*) args[0]);
+        if (xposedIsHooked(meth)) {
+            meth = (Method*) meth->insns;
+        }
     }
+    ArrayObject* params = (ArrayObject*) args[2];
+    ClassObject* returnType = (ClassObject*) args[3];
+    Object* thisObject = (Object*) args[4]; // null for static methods
+    ArrayObject* argList = (ArrayObject*) args[5];
 
-    // dereference parameters
-    ::Thread* self = dvmThreadSelf();
-    Object* thisObject = dvmDecodeIndirectRef(self, thisObject1);
-    ArrayObject* args = (ArrayObject*)dvmDecodeIndirectRef(self, args1);
-    ArrayObject* params = (ArrayObject*)dvmDecodeIndirectRef(self, params1);
-    ClassObject* returnType = (ClassObject*)dvmDecodeIndirectRef(self, returnType1);
-    
     // invoke the method
-    dvmChangeStatus(self, THREAD_RUNNING);
-    Object* result = dvmInvokeMethod(thisObject, method, args, params, returnType, true);
-    dvmChangeStatus(self, THREAD_NATIVE);
-    
-    return xposedAddLocalReference(self, result);
+    pResult->l = dvmInvokeMethod(thisObject, meth, argList, params, returnType, true);
+    return;
 }
 
 static void android_content_res_XResources_rewriteXmlReferencesNative(JNIEnv* env, jclass clazz,
@@ -604,8 +609,7 @@ static jobject de_robv_android_xposed_XposedBridge_getStartClassName(JNIEnv* env
 static const JNINativeMethod xposedMethods[] = {
     {"getStartClassName", "()Ljava/lang/String;", (void*)de_robv_android_xposed_XposedBridge_getStartClassName},
     {"initNative", "()Z", (void*)de_robv_android_xposed_XposedBridge_initNative},
-    {"hookMethodNative", "(Ljava/lang/Class;I)V", (void*)de_robv_android_xposed_XposedBridge_hookMethodNative},
-    {"invokeOriginalMethodNative", "(Ljava/lang/reflect/Member;[Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;", (void*)de_robv_android_xposed_XposedBridge_invokeOriginalMethodNative},
+    {"hookMethodNative", "(Ljava/lang/reflect/Member;Ljava/lang/Class;ILjava/lang/Object;)V", (void*)de_robv_android_xposed_XposedBridge_hookMethodNative},
 };
 
 static const JNINativeMethod xresourcesMethods[] = {

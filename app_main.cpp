@@ -414,6 +414,7 @@ int main(int argc, char* const argv[])
     runtime.mParentDir = parentDir;
     
     xposedInfo();
+    xposedEnforceDalvik();
     keepLoadingXposed = !isXposedDisabled() && !xposedShouldIgnoreCommand(className, argc, argv) && addXposedToClasspath(zygote);
 
     if (zygote) {
