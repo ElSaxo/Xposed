@@ -336,7 +336,7 @@ static void xposedCallHandler(const u4* args, JValue* pResult, const Method* met
     dvmCallMethod(self, xposedHandleHookedMethod, NULL, &result,
         originalReflected, (int) original, additionalInfo, thisObject, argsArray);
         
-    dvmReleaseTrackedAlloc(argsArray, self);
+    dvmReleaseTrackedAlloc((Object *)argsArray, self);
 
     // exceptions are thrown to the caller
     if (dvmCheckException(self)) {
@@ -353,8 +353,8 @@ static void xposedCallHandler(const u4* args, JValue* pResult, const Method* met
         }
         pResult->l = NULL;
     } else {
-        if (!dvmUnboxPrimitive(result.l, returnType, pResult)) {
-            dvmThrowClassCastException(result.l->clazz, returnType);
+        if (!dvmUnboxPrimitive((Object *)result.l, returnType, pResult)) {
+            dvmThrowClassCastException(((Object *)result.l)->clazz, returnType);
         }
     }
 }
