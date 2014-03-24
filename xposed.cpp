@@ -25,6 +25,9 @@
 #include <stdio.h>
 #include <sys/mman.h>
 #include <cutils/properties.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <dlfcn.h>
 
 #include "xposed_offsets.h"
@@ -89,16 +92,19 @@ void xposedInfo() {
     char manufacturer[PROPERTY_VALUE_MAX];
     char model[PROPERTY_VALUE_MAX];
     char rom[PROPERTY_VALUE_MAX];
+    char fingerprint[PROPERTY_VALUE_MAX];
     
     property_get("ro.build.version.release", release, "n/a");
     property_get("ro.build.version.sdk", sdk, "n/a");
     property_get("ro.product.manufacturer", manufacturer, "n/a");
     property_get("ro.product.model", model, "n/a");
     property_get("ro.build.display.id", rom, "n/a");
+    property_get("ro.build.fingerprint", fingerprint, "n/a");
     
     ALOGD("Starting Xposed binary version %s, compiled for SDK %d\n", XPOSED_VERSION, PLATFORM_SDK_VERSION);
     ALOGD("Phone: %s (%s), Android version %s (SDK %s)\n", model, manufacturer, release, sdk);
     ALOGD("ROM: %s\n", rom);
+    ALOGD("Build fingerprint: %s\n", fingerprint);
 }
 
 void xposedEnforceDalvik() {
@@ -113,6 +119,13 @@ void xposedEnforceDalvik() {
     }
 }
 
+void disableXposed() {
+    int fd;
+    fd = open(XPOSED_LOAD_BLOCKER, O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR);
+    if (fd >= 0)
+        close(fd);
+}
+
 bool isXposedDisabled() {
     // is the blocker file present?
     if (access(XPOSED_LOAD_BLOCKER, F_OK) == 0) {
@@ -121,6 +134,23 @@ bool isXposedDisabled() {
     }
     return false;
 }
+
+bool xposedSkipSafemodeDelay() {
+    // is the flag file present?
+    if (access(XPOSED_SAFEMODE_NODELAY, F_OK) == 0)
+        return true;
+    else
+        return false;
+}
+
+bool xposedDisableSafemode() {
+    // is the flag file present?
+    if (access(XPOSED_SAFEMODE_DISABLE, F_OK) == 0)
+        return true;
+    else
+        return false;
+}
+
 
 // ignore the broadcasts by various Superuser implementations to avoid spamming the Xposed log
 bool xposedShouldIgnoreCommand(const char* className, int argc, const char* const argv[]) {
@@ -168,7 +198,11 @@ bool addXposedToClasspath(bool zygote) {
             setenv("CLASSPATH", XPOSED_JAR, 1);
         } else {
             char classPath[4096];
-            sprintf(classPath, "%s:%s", XPOSED_JAR, oldClassPath);
+            int neededLength = snprintf(classPath, sizeof(classPath), "%s:%s", XPOSED_JAR, oldClassPath);
+            if (neededLength >= (int)sizeof(classPath)) {
+                ALOGE("ERROR: CLASSPATH would exceed %d characters", sizeof(classPath));
+                return false;
+            }
             setenv("CLASSPATH", classPath, 1);
         }
         ALOGI("Added Xposed (%s) to CLASSPATH.\n", XPOSED_JAR);

@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include "xposed.h"
+#include "xposed_safemode.h"
 
 int RUNNING_PLATFORM_SDK_VERSION = 0;
 void (*PTR_atrace_set_tracing_enabled)(bool) = NULL;
@@ -327,6 +328,17 @@ int main(int argc, char* const argv[])
         return 0;
     }
 
+    if (argc == 2 && strcmp(argv[1], "--xposedtestsafemode") == 0) {
+        printf("Testing Xposed safemode trigger\n");
+
+        if (xposed::detectSafemodeTrigger(xposedSkipSafemodeDelay())) {
+            printf("Safemode triggered\n");
+        } else {
+            printf("Safemode not triggered\n");
+        }
+        return 0;
+    }
+
 #if PLATFORM_SDK_VERSION >= 16
 #ifdef __arm__
     /*
@@ -404,6 +416,11 @@ int main(int argc, char* const argv[])
             className = arg;
             break;
         }
+    }
+
+    if (zygote) {
+        if (!xposedDisableSafemode() && xposed::detectSafemodeTrigger(xposedSkipSafemodeDelay()))
+            disableXposed();
     }
 
     if (niceName && *niceName) {
