@@ -151,6 +151,17 @@ bool xposedDisableSafemode() {
         return false;
 }
 
+static int xposedReadIntConfig(const char* fileName, int defaultValue) {
+    FILE *fp = fopen(fileName, "r");
+    if (fp == NULL)
+        return defaultValue;
+
+    int result;
+    int success = fscanf(fp, "%i", &result);
+    fclose(fp);
+
+    return (success >= 1) ? result : defaultValue;
+}
 
 // ignore the broadcasts by various Superuser implementations to avoid spamming the Xposed log
 bool xposedShouldIgnoreCommand(const char* className, int argc, const char* const argv[]) {
@@ -213,96 +224,6 @@ bool addXposedToClasspath(bool zygote) {
     }
 }
 
-
-enum XposedMakePublicType {
-    XPOSED_MAKE_PUBLIC_CLASS,
-    XPOSED_MAKE_PUBLIC_VIRTUAL_METHOD,
-    XPOSED_MAKE_PUBLIC_DIRECT_METHOD,
-    XPOSED_MAKE_PUBLIC_INSTANCE_FIELD,
-    //XPOSED_MAKE_PUBLIC_STATIC_FIELD,
-};
-
-struct XposedMakePublicObject {
-    const char* className;
-    const enum XposedMakePublicType type;
-    const char* name;
-    const char* signature;
-};
-
-static const struct XposedMakePublicObject xposedMakePublicList[] = {
-    { "android/app/ActivityThread", XPOSED_MAKE_PUBLIC_INSTANCE_FIELD, "mBoundApplication", "Landroid/app/ActivityThread$AppBindData;" },
-    { "android/app/ActivityThread", XPOSED_MAKE_PUBLIC_INSTANCE_FIELD, "mConfiguration", "Landroid/content/res/Configuration;" },
-    { "android/app/ActivityThread$AppBindData", XPOSED_MAKE_PUBLIC_CLASS, NULL, NULL },
-    { "android/app/ActivityThread$AppBindData", XPOSED_MAKE_PUBLIC_INSTANCE_FIELD, "appInfo", "Landroid/content/pm/ApplicationInfo;" },
-    { "android/content/res/Resources", XPOSED_MAKE_PUBLIC_VIRTUAL_METHOD, "loadXmlResourceParser", "(ILjava/lang/String;)Landroid/content/res/XmlResourceParser;" },
-    { "android/content/res/Resources", XPOSED_MAKE_PUBLIC_INSTANCE_FIELD, "mTmpValue", "Landroid/util/TypedValue;" },
-    { "android/content/res/XmlBlock$Parser", XPOSED_MAKE_PUBLIC_CLASS, NULL, NULL },
-    { "android/content/res/XmlBlock$Parser", XPOSED_MAKE_PUBLIC_INSTANCE_FIELD, "mParseState", "I" },
-    { NULL, XPOSED_MAKE_PUBLIC_CLASS, NULL, NULL },
-};
-
-static bool xposedMakeClassesPublic(JNIEnv* env, const XposedMakePublicObject* list) {
-    const bool LOG_MISSING_OBJECTS = true;
-    ClassObject* clz = NULL;
-    Method* meth;
-    InstField* ifield;
-    const char* lastClassName = "";
-
-    for (const XposedMakePublicObject* obj = list; obj->className != NULL; obj++) {
-        // load class if not done yet
-        if (strcmp(obj->className, lastClassName) != 0) {
-            lastClassName = obj->className;
-            jclass jclz = env->FindClass(obj->className);
-            if (jclz != NULL) {
-                clz = (ClassObject*) dvmDecodeIndirectRef(dvmThreadSelf(), jclz);
-            } else {
-                if (LOG_MISSING_OBJECTS) ALOGE("Could not find class %s", obj->className);
-                clz = NULL;
-                env->ExceptionClear();
-                continue;
-            }
-        } else if (clz == NULL) {
-            continue;
-        }
-
-        // make class/method/field public
-        // not using switch here because it generates undefined references to __gnu_thumb1_case_uqi
-        if (obj->type == XPOSED_MAKE_PUBLIC_CLASS) {
-            SET_CLASS_FLAG(clz, ACC_PUBLIC);
-
-        } else if (obj->type == XPOSED_MAKE_PUBLIC_VIRTUAL_METHOD) {
-            meth = dvmFindVirtualMethodHierByDescriptor(clz, obj->name, obj->signature);
-            if (meth == NULL) {
-                if (LOG_MISSING_OBJECTS) ALOGE("Could not find virtual method %s:%s in class %s", obj->name, obj->signature, obj->className);
-                env->ExceptionClear();
-                continue;
-            }
-            SET_METHOD_FLAG(meth, ACC_PUBLIC);
-
-        } else if (obj->type == XPOSED_MAKE_PUBLIC_DIRECT_METHOD) {
-            meth = dvmFindDirectMethodByDescriptor(clz, obj->name, obj->signature);
-            if (meth == NULL) {
-                if (LOG_MISSING_OBJECTS) ALOGE("Could not find direct method %s:%s in class %s", obj->name, obj->signature, obj->className);
-                env->ExceptionClear();
-                continue;
-            }
-            SET_METHOD_FLAG(meth, ACC_PUBLIC);
-
-        } else if (obj->type == XPOSED_MAKE_PUBLIC_INSTANCE_FIELD) {
-            ifield = dvmFindInstanceFieldHier(clz, obj->name, obj->signature);
-            if (ifield == NULL) {
-                if (LOG_MISSING_OBJECTS) ALOGE("Could not find instance field %s:%s in class %s", obj->name, obj->signature, obj->className);
-                env->ExceptionClear();
-                continue;
-            }
-            ifield->accessFlags |= ACC_PUBLIC;
-        }
-    }
-
-    return true;
-}
-
-
 static void xposedPrepareSubclassReplacement(jclass clazz) {
     // clazz is supposed to replace its superclass, so make sure enough memory is allocated
     ClassObject* sub = (ClassObject*) dvmDecodeIndirectRef(dvmThreadSelf(), clazz);
@@ -317,8 +238,6 @@ bool xposedOnVmCreated(JNIEnv* env, const char* className) {
     keepLoadingXposed = keepLoadingXposed && xposedInitMemberOffsets(env);
     if (!keepLoadingXposed)
         return false;
-
-    xposedMakeClassesPublic(env, xposedMakePublicList);
 
     jclass miuiResourcesClass = env->FindClass(MIUI_RESOURCES_CLASS);
     if (miuiResourcesClass != NULL) {
@@ -335,7 +254,6 @@ bool xposedOnVmCreated(JNIEnv* env, const char* className) {
         ALOGE("Error while loading XTypedArray class '%s':\n", XTYPEDARRAY_CLASS);
         dvmLogExceptionStackTrace();
         env->ExceptionClear();
-        keepLoadingXposed = false;
         return false;
     }
     xposedPrepareSubclassReplacement(xTypedArrayClass);
@@ -353,6 +271,7 @@ bool xposedOnVmCreated(JNIEnv* env, const char* className) {
     ALOGI("Found Xposed class '%s', now initializing\n", XPOSED_CLASS);
     if (register_de_robv_android_xposed_XposedBridge(env) != JNI_OK) {
         ALOGE("Could not register natives for '%s'\n", XPOSED_CLASS);
+        env->ExceptionClear();
         return false;
     }
     return true;
@@ -370,6 +289,12 @@ static bool xposedInitMemberOffsets(JNIEnv* env) {
     ALOGD("Using structure member offsets for mode %s", xposedOffsetModesDesc[offsetMode]);
 
     MEMBER_OFFSET_COPY(DvmJitGlobals, codeCacheFull);
+
+    int overrideCodeCacheFull = xposedReadIntConfig(XPOSED_OVERRIDE_JIT_RESET_OFFSET, -1);
+    if (overrideCodeCacheFull > 0 && overrideCodeCacheFull < 0x400) {
+        ALOGI("Offset for DvmJitGlobals.codeCacheFull is overridden, new value is 0x%x", overrideCodeCacheFull);
+        MEMBER_OFFSET_VAR(DvmJitGlobals, codeCacheFull) = overrideCodeCacheFull;
+    }
 
     // detect offset of ArrayObject->contents
     jintArray dummyArray = env->NewIntArray(1);
@@ -550,6 +475,8 @@ static jboolean de_robv_android_xposed_XposedBridge_initNative(JNIEnv* env, jcla
     }
     if (register_android_content_res_XResources(env) != JNI_OK) {
         ALOGE("Could not register natives for '%s'\n", XRESOURCES_CLASS);
+        env->ExceptionClear();
+        keepLoadingXposed = false;
         return false;
     }
 
@@ -612,7 +539,12 @@ static void de_robv_android_xposed_XposedBridge_hookMethodNative(JNIEnv* env, jc
 
     if (PTR_gDvmJit != NULL) {
         // reset JIT cache
-        MEMBER_VAL(PTR_gDvmJit, DvmJitGlobals, codeCacheFull) = true;
+        char currentValue = *((char*)PTR_gDvmJit + MEMBER_OFFSET_VAR(DvmJitGlobals,codeCacheFull));
+        if (currentValue == 0 || currentValue == 1) {
+            MEMBER_VAL(PTR_gDvmJit, DvmJitGlobals, codeCacheFull) = true;
+        } else {
+            ALOGE("Unexpected current value for codeCacheFull: %d", currentValue);
+        }
     }
 }
 
@@ -714,6 +646,10 @@ static jobject de_robv_android_xposed_XposedBridge_getStartClassName(JNIEnv* env
 static void de_robv_android_xposed_XposedBridge_setObjectClassNative(JNIEnv* env, jclass clazz, jobject objIndirect, jclass clzIndirect) {
     Object* obj = (Object*) dvmDecodeIndirectRef(dvmThreadSelf(), objIndirect);
     ClassObject* clz = (ClassObject*) dvmDecodeIndirectRef(dvmThreadSelf(), clzIndirect);
+    if (clz->status < CLASS_INITIALIZED && !dvmInitClass(clz)) {
+        ALOGE("Could not initialize class %s", clz->descriptor);
+        return;
+    }
     obj->clazz = clz;
 }
 
@@ -736,7 +672,11 @@ static jobject de_robv_android_xposed_XposedBridge_cloneToSubclassNative(JNIEnv*
     memcpy((char*)copy + offset, (char*)obj + offset, size - offset);
 
     if (IS_CLASS_FLAG_SET(clz, CLASS_ISFINALIZABLE))
+#if PLATFORM_SDK_VERSION >= 14
         dvmSetFinalizable(copy);
+#else
+	dvmHeapAddRefToLargeTable(&gDvm.gcHeap->finalizableRefs, copy);
+#endif
 
     return copyIndirect;
 }
