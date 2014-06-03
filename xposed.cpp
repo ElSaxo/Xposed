@@ -4,11 +4,6 @@
 
 #define LOG_TAG "Xposed"
 
-#include <sys/syscall.h>
-#ifdef __ARM_NR_cacheflush
-#define __clear_cache(x, y) syscall(__ARM_NR_cacheflush, x, y, 0)
-#endif
-
 #include "xposed.h"
 
 #include <utils/Log.h>
@@ -675,7 +670,7 @@ static jobject de_robv_android_xposed_XposedBridge_cloneToSubclassNative(JNIEnv*
 #if PLATFORM_SDK_VERSION >= 14
         dvmSetFinalizable(copy);
 #else
-	dvmHeapAddRefToLargeTable(&gDvm.gcHeap->finalizableRefs, copy);
+        dvmHeapAddRefToLargeTable(&gDvm.gcHeap->finalizableRefs, copy);
 #endif
 
     return copyIndirect;
